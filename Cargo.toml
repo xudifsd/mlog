@@ -6,3 +6,5 @@ edition = "2018"
 
 [dependencies]
 clap = "2"
+toml = "0.4"
+dirs = "1.0"
