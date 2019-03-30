@@ -12,37 +12,127 @@ use std::io::prelude::*;
 
 use clap::{Arg, App};
 
+#[derive(Debug)]
 enum LogMode {
     TEE,
     REDIRECT,
 }
 
+#[derive(Debug)]
 struct FileConfig {
     mode: LogMode,
-    num: i32, // default to 5
+    name: String,
+    num: u32, // default to 5, must larger than 0
     time: u32, // timestamp integer, 0 means no limit
     size: u32, // byte, 0 means no limit
 }
 
 impl FileConfig {
-    fn new() -> Self {
-        FileConfig {mode: LogMode::REDIRECT, num: 5, time: 0, size: 0}
+    fn new(value: &Value) -> Self {
+        if value.get("target").is_none() && value["target"].as_str().unwrap() != "file" {
+            panic!("no target found, should be `target=\"file\"`");
+        }
+
+        if value.get("file").is_none() || value["file"].get("name").is_none() {
+            panic!("no file configure");
+        }
+
+        let name = String::from(value["file"]["name"].as_str().unwrap());
+        let file = &value["file"];
+        let smode = value.get("mode");
+
+        let mode = if smode.is_none() {
+            LogMode::REDIRECT
+        } else if smode.unwrap().as_str().unwrap() == "redirect" {
+            LogMode::REDIRECT
+        } else if smode.unwrap().as_str().unwrap() == "tee" {
+            LogMode::TEE
+        } else {
+            panic!("unknown mode {}", smode.unwrap());
+        };
+
+        let snum = file.get("num");
+        let num = if snum.is_none() {
+            5
+        } else {
+            let snum = snum.unwrap().as_integer().unwrap();
+            if snum < 0 {
+                panic!("file.num can not be less than 0");
+            }
+            snum as u32
+        };
+
+        let stime = file.get("time");
+        let time = if stime.is_none() {
+            0
+        } else {
+            let stime = stime.unwrap().as_str().unwrap();
+            if stime.len() == 0 {
+                panic!("unknown file.time");
+            } else if stime.chars().last().unwrap() == 'h' {
+                let head = &stime[..stime.len() - 1];
+                let time = head.parse::<f32>().unwrap();
+                (time * 3600.0) as u32
+            } else if stime.chars().last().unwrap() == 'd' {
+                let head = &stime[..stime.len() - 1];
+                let time = head.parse::<f32>().unwrap();
+                (time * 3600.0 * 24.0) as u32
+            } else {
+                panic!("unknown file.time {}", stime);
+            }
+        };
+
+        let ssize = file.get("size");
+        let size = if ssize.is_none() {
+            0
+        } else {
+            let ssize = ssize.unwrap().as_str().unwrap();
+            if ssize.len() == 0 {
+                panic!("unknown file.size");
+            } else if ssize.chars().last().unwrap() == 'K' {
+                let head = &ssize[..ssize.len() - 1];
+                let size = head.parse::<i32>().unwrap();
+                (size * 1024) as u32
+            } else if ssize.chars().last().unwrap() == 'M' {
+                let head = &ssize[..ssize.len() - 1];
+                let size = head.parse::<i32>().unwrap();
+                (size * 1024 * 1024) as u32
+            } else if ssize.chars().last().unwrap() == 'G' {
+                let head = &ssize[..ssize.len() - 1];
+                let size = head.parse::<i32>().unwrap();
+                (size * 1024 * 1024 * 1024) as u32
+            } else {
+                panic!("unknown file.size {}", ssize);
+            }
+        };
+
+        FileConfig {mode: mode, name: name, num: num, time: time, size: size}
     }
 }
 
+#[derive(Debug)]
 struct LogConfig {
-    mlog: FileConfig,
-    stdout: FileConfig,
-    stderr: FileConfig,
+    mlog: Option<FileConfig>,
+    stdout: Option<FileConfig>,
+    stderr: Option<FileConfig>,
 }
 
 impl LogConfig {
-    fn new() -> Self {
-        LogConfig {mlog: FileConfig::new(), stdout: FileConfig::new(), stderr: FileConfig::new()}
-    }
+    fn new(value: &Value) -> Self {
+        let mlog = match value.get("mlog") {
+            None => None,
+            Some(c) => Some(FileConfig::new(c)),
+        };
+        let stdout = match value.get("stdout") {
+            None => None,
+            Some(c) => Some(FileConfig::new(c)),
+        };
+        let stderr = match value.get("stderr") {
+            None => None,
+            Some(c) => Some(FileConfig::new(c)),
+        };
 
-    fn parse(&mut self, config: Value) {
-        println!("{:?}", config["stdout"]); // TODO
+        LogConfig { mlog: mlog, stdout: stdout, stderr: stderr}
     }
 }
 
@@ -62,10 +152,7 @@ fn get_config(config_path: Option<&str>) -> Result<LogConfig, std::io::Error> {
 
     let value = content.parse::<Value>().unwrap();
 
-    let mut result = LogConfig::new();
-    result.parse(value);
-
-    Ok(result)
+    Ok(LogConfig::new(&value))
 }
 
 fn main() -> io::Result<()> {
@@ -82,7 +169,7 @@ fn main() -> io::Result<()> {
                                .last(true))
                           .get_matches();
 
-    let config = get_config(matches.value_of("config"));
+    let _config = get_config(matches.value_of("config"));
 
     let cmd = matches.values_of("cmd").map(|vals| vals.collect::<Vec<_>>()).unwrap();
 
