@@ -173,13 +173,30 @@ impl LogHandler<ChildStdout> {
     fn process(&mut self) -> std::io::Result<()> {
         let mut buf = String::new();
 
-        loop {
-            let len = self.input.read_line(&mut buf)?;
-            if len == 0 {
-                return Ok(());
+        match self.config {
+            None => {
+                loop {
+                    let len = self.input.read_line(&mut buf)?;
+                    if len == 0 {
+                        return Ok(());
+                    }
+                    eprint!("{}", buf);
+                    buf.clear();
+                }
+            },
+            Some(ref config) => {
+                loop {
+                    let len = self.input.read_line(&mut buf)?;
+                    if len == 0 {
+                        return Ok(());
+                    }
+                    match config.mode {
+                        LogMode::TEE => print!("{}", buf),
+                        _ => {}
+                    }
+                    buf.clear();
+                }
             }
-            eprint!("{}", buf);
-            buf.clear();
         }
     }
 }
@@ -188,13 +205,30 @@ impl LogHandler<ChildStderr> {
     fn process(&mut self) -> std::io::Result<()> {
         let mut buf = String::new();
 
-        loop {
-            let len = self.input.read_line(&mut buf)?;
-            if len == 0 {
-                return Ok(());
+        match self.config {
+            None => {
+                loop {
+                    let len = self.input.read_line(&mut buf)?;
+                    if len == 0 {
+                        return Ok(());
+                    }
+                    eprint!("{}", buf);
+                    buf.clear();
+                }
+            },
+            Some(ref config) => {
+                loop {
+                    let len = self.input.read_line(&mut buf)?;
+                    if len == 0 {
+                        return Ok(());
+                    }
+                    match config.mode {
+                        LogMode::TEE => eprint!("{}", buf),
+                        _ => {}
+                    }
+                    buf.clear();
+                }
             }
-            eprint!("{}", buf);
-            buf.clear();
         }
     }
 }
