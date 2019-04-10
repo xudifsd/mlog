@@ -218,15 +218,15 @@ fn main() -> io::Result<()> {
 
     let cmd = matches.values_of("cmd").map(|vals| vals.collect::<Vec<_>>()).unwrap();
 
-    let child = Command::new(&cmd[0])
+    let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
         // do not redirect stdin, let cmd inherented from mlog
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let stdout = child.stdout.expect("Could not capture standard output.");
-    let stderr = child.stderr.expect("Could not capture standard error.");
+    let stdout = child.stdout.take().expect("Could not capture standard output.");
+    let stderr = child.stderr.take().expect("Could not capture standard error.");
 
     let mut out_handler = LogHandler::new(config.stdout, stdout)?;
     let mut err_handler = LogHandler::new(config.stderr, stderr)?;
@@ -240,6 +240,10 @@ fn main() -> io::Result<()> {
 
     out_thread.join();
     err_thread.join();
+
+    let exit_code = child.wait().expect("child was not running").code().unwrap();
+
+    std::process::exit(exit_code);
 
     Ok(())
 }
