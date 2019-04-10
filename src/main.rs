@@ -1,4 +1,6 @@
-use std::process::{Command, Stdio};
+use std::process::{Command, Stdio, ChildStdout, ChildStderr};
+
+use std::thread;
 
 use toml::Value;
 use dirs;
@@ -155,6 +157,49 @@ fn get_config(config_path: Option<&str>) -> Result<LogConfig, std::io::Error> {
     Ok(LogConfig::new(&value))
 }
 
+struct LogHandler<T: Read> {
+    config: Option<FileConfig>,
+    input: BufReader<T>,
+    // output: File, // TODO, implement log rotation
+}
+
+impl<T: Read> LogHandler<T> {
+    fn new(config: Option<FileConfig>, input: T) -> Result<Self, std::io::Error> {
+        Ok(LogHandler {config: config, input: BufReader::new(input)})
+    }
+}
+
+impl LogHandler<ChildStdout> {
+    fn process(&mut self) -> std::io::Result<()> {
+        let mut buf = String::new();
+
+        loop {
+            let len = self.input.read_line(&mut buf)?;
+            if len == 0 {
+                return Ok(());
+            }
+            eprint!("{}", buf);
+            buf.clear();
+        }
+    }
+}
+
+impl LogHandler<ChildStderr> {
+    fn process(&mut self) -> std::io::Result<()> {
+        let mut buf = String::new();
+
+        loop {
+            let len = self.input.read_line(&mut buf)?;
+            if len == 0 {
+                return Ok(());
+            }
+            eprint!("{}", buf);
+            buf.clear();
+        }
+    }
+}
+
+
 fn main() -> io::Result<()> {
     let matches = App::new("Manage cmd logs for you")
                           .version("0.1")
@@ -169,7 +214,7 @@ fn main() -> io::Result<()> {
                                .last(true))
                           .get_matches();
 
-    let _config = get_config(matches.value_of("config"));
+    let config = get_config(matches.value_of("config"))?;
 
     let cmd = matches.values_of("cmd").map(|vals| vals.collect::<Vec<_>>()).unwrap();
 
@@ -183,16 +228,18 @@ fn main() -> io::Result<()> {
     let stdout = child.stdout.expect("Could not capture standard output.");
     let stderr = child.stderr.expect("Could not capture standard error.");
 
-    let out_reader = BufReader::new(stdout);
-    let err_reader = BufReader::new(stderr);
+    let mut out_handler = LogHandler::new(config.stdout, stdout)?;
+    let mut err_handler = LogHandler::new(config.stderr, stderr)?;
 
-    out_reader.lines()
-        .filter_map(|line| line.ok())
-        .for_each(|line| println!("{}", line));
+    let out_thread = thread::spawn(move || {
+        out_handler.process();
+    });
+    let err_thread = thread::spawn(move || {
+        err_handler.process();
+    });
 
-    err_reader.lines()
-        .filter_map(|line| line.ok())
-        .for_each(|line| eprintln!("err: {}", line));
+    out_thread.join();
+    err_thread.join();
 
     Ok(())
 }
