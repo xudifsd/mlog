@@ -1,4 +1,4 @@
-use std::process::{Command, Stdio, ChildStdout, ChildStderr};
+use std::process::{Command, Stdio};
 
 use std::thread;
 
@@ -6,10 +6,12 @@ use toml::Value;
 use dirs;
 
 use std::path::Path;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+
+use std::time::SystemTime;
 
 use std::io;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, BufWriter};
 use std::io::prelude::*;
 
 use clap::{Arg, App};
@@ -25,12 +27,12 @@ struct FileConfig {
     mode: LogMode,
     name: String,
     num: u32, // default to 5, must larger than 0
-    time: u32, // timestamp integer, 0 means no limit
-    size: u32, // byte, 0 means no limit
+    time: u64, // timestamp integer, 0 means no limit
+    size: u64, // byte, 0 means no limit
 }
 
 impl FileConfig {
-    fn new(value: &Value) -> Self {
+    fn new(value: &Value, ignore_mode: bool) -> Self {
         if value.get("target").is_none() && value["target"].as_str().unwrap() != "file" {
             panic!("no target found, should be `target=\"file\"`");
         }
@@ -43,7 +45,7 @@ impl FileConfig {
         let file = &value["file"];
         let smode = value.get("mode");
 
-        let mode = if smode.is_none() {
+        let mode = if smode.is_none() || ignore_mode {
             LogMode::REDIRECT
         } else if smode.unwrap().as_str().unwrap() == "redirect" {
             LogMode::REDIRECT
@@ -73,12 +75,12 @@ impl FileConfig {
                 panic!("unknown file.time");
             } else if stime.chars().last().unwrap() == 'h' {
                 let head = &stime[..stime.len() - 1];
-                let time = head.parse::<f32>().unwrap();
-                (time * 3600.0) as u32
+                let time = head.parse::<f64>().unwrap();
+                (time * 3600.0) as u64
             } else if stime.chars().last().unwrap() == 'd' {
                 let head = &stime[..stime.len() - 1];
-                let time = head.parse::<f32>().unwrap();
-                (time * 3600.0 * 24.0) as u32
+                let time = head.parse::<f64>().unwrap();
+                (time * 3600.0 * 24.0) as u64
             } else {
                 panic!("unknown file.time {}", stime);
             }
@@ -93,16 +95,16 @@ impl FileConfig {
                 panic!("unknown file.size");
             } else if ssize.chars().last().unwrap() == 'K' {
                 let head = &ssize[..ssize.len() - 1];
-                let size = head.parse::<i32>().unwrap();
-                (size * 1024) as u32
+                let size = head.parse::<f64>().unwrap();
+                (size * 1024.0) as u64
             } else if ssize.chars().last().unwrap() == 'M' {
                 let head = &ssize[..ssize.len() - 1];
-                let size = head.parse::<i32>().unwrap();
-                (size * 1024 * 1024) as u32
+                let size = head.parse::<f64>().unwrap();
+                (size * 1024.0 * 1024.0) as u64
             } else if ssize.chars().last().unwrap() == 'G' {
                 let head = &ssize[..ssize.len() - 1];
-                let size = head.parse::<i32>().unwrap();
-                (size * 1024 * 1024 * 1024) as u32
+                let size = head.parse::<f64>().unwrap();
+                (size * 1024.0 * 1024.0 * 1024.0) as u64
             } else {
                 panic!("unknown file.size {}", ssize);
             }
@@ -123,15 +125,15 @@ impl LogConfig {
     fn new(value: &Value) -> Self {
         let mlog = match value.get("mlog") {
             None => None,
-            Some(c) => Some(FileConfig::new(c)),
+            Some(c) => Some(FileConfig::new(c, true)),
         };
         let stdout = match value.get("stdout") {
             None => None,
-            Some(c) => Some(FileConfig::new(c)),
+            Some(c) => Some(FileConfig::new(c, false)),
         };
         let stderr = match value.get("stderr") {
             None => None,
-            Some(c) => Some(FileConfig::new(c)),
+            Some(c) => Some(FileConfig::new(c, false)),
         };
 
         LogConfig { mlog: mlog, stdout: stdout, stderr: stderr}
@@ -157,19 +159,25 @@ fn get_config(config_path: Option<&str>) -> Result<LogConfig, std::io::Error> {
     Ok(LogConfig::new(&value))
 }
 
-struct LogHandler<T: Read> {
+struct LogHandler<R: Read, W: Write> {
     config: Option<FileConfig>,
-    input: BufReader<T>,
-    // output: File, // TODO, implement log rotation
+    input: BufReader<R>,
+    output: BufWriter<W>,
 }
 
-impl<T: Read> LogHandler<T> {
-    fn new(config: Option<FileConfig>, input: T) -> Result<Self, std::io::Error> {
-        Ok(LogHandler {config: config, input: BufReader::new(input)})
+impl<T: Read, W: Write> LogHandler<T, W> {
+    fn new(
+        config: Option<FileConfig>,
+        input: T,
+        output: W
+    ) -> Result<Self, std::io::Error> {
+        Ok(LogHandler {
+            config: config,
+            input: BufReader::new(input),
+            output: BufWriter::new(output),
+        })
     }
-}
 
-impl LogHandler<ChildStdout> {
     fn process(&mut self) -> std::io::Result<()> {
         let mut buf = String::new();
 
@@ -180,20 +188,64 @@ impl LogHandler<ChildStdout> {
                     if len == 0 {
                         return Ok(());
                     }
-                    eprint!("{}", buf);
+                    write!(self.output, "{}", buf)?;
                     buf.clear();
                 }
             },
             Some(ref config) => {
+                let path = config.name.as_str();
+
+                rotate_files(path, config.num)?;
+
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(path)?;
+
+                let mut c_time = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+                let mut size = 0;
+
                 loop {
                     let len = self.input.read_line(&mut buf)?;
                     if len == 0 {
                         return Ok(());
                     }
-                    match config.mode {
-                        LogMode::TEE => print!("{}", buf),
-                        _ => {}
+
+                    let now = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+                    if config.time != 0 && now - c_time >= config.time {
+                        rotate_files(path, config.num)?;
+
+                        file = OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(path)?;
+                        c_time = now;
+                        size = 0
                     }
+
+                    if config.size != 0 && size >= config.size {
+                        rotate_files(path, config.num)?;
+
+                        file = OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(path)?;
+                        c_time = now;
+                        size = 0
+                    }
+
+                    match config.mode {
+                        LogMode::TEE => write!(self.output, "{}", buf)?,
+                        _ => {},
+                    }
+
+                    write!(file, "{}", buf)?;
+                    size += len as u64;
+
                     buf.clear();
                 }
             }
@@ -201,38 +253,49 @@ impl LogHandler<ChildStdout> {
     }
 }
 
-impl LogHandler<ChildStderr> {
-    fn process(&mut self) -> std::io::Result<()> {
-        let mut buf = String::new();
+fn rotate_files(path: &str, num: u32) -> io::Result<()> {
+    let mut i = num - 1;
 
-        match self.config {
-            None => {
-                loop {
-                    let len = self.input.read_line(&mut buf)?;
-                    if len == 0 {
-                        return Ok(());
-                    }
-                    eprint!("{}", buf);
-                    buf.clear();
-                }
-            },
-            Some(ref config) => {
-                loop {
-                    let len = self.input.read_line(&mut buf)?;
-                    if len == 0 {
-                        return Ok(());
-                    }
-                    match config.mode {
-                        LogMode::TEE => eprint!("{}", buf),
-                        _ => {}
-                    }
-                    buf.clear();
-                }
-            }
+    let mut from = String::new();
+    let mut to = String::new();
+
+    while i > 1 {
+        from.clear();
+        to.clear();
+
+        from.push_str(path);
+        from.push('.');
+        from.push_str((i - 1).to_string().as_str());
+
+        to.push_str(path);
+        to.push('.');
+        to.push_str(i.to_string().as_str());
+
+        i -= 1;
+
+        if !Path::new(from.as_str()).is_file() {
+            continue;
         }
-    }
-}
 
+        // mv log.(i - 1) log.i
+        std::fs::rename(from.as_str(), to.as_str())?;
+    }
+
+    from.clear();
+    to.clear();
+
+    from.push_str(path);
+
+    to.push_str(path);
+    to.push_str(".1");
+
+    // mv log log.1
+    if Path::new(from.as_str()).is_file() {
+        std::fs::rename(from.as_str(), to.as_str())?;
+    }
+
+    Ok(())
+}
 
 fn main() -> io::Result<()> {
     let matches = App::new("Manage cmd logs for you")
@@ -262,22 +325,41 @@ fn main() -> io::Result<()> {
     let stdout = child.stdout.take().expect("Could not capture standard output.");
     let stderr = child.stderr.take().expect("Could not capture standard error.");
 
-    let mut out_handler = LogHandler::new(config.stdout, stdout)?;
-    let mut err_handler = LogHandler::new(config.stderr, stderr)?;
+    let mut out_handler = LogHandler::new(config.stdout, stdout, std::io::stdout())?;
+    let mut err_handler = LogHandler::new(config.stderr, stderr, std::io::stderr())?;
 
     let out_thread = thread::spawn(move || {
-        out_handler.process();
-    });
-    let err_thread = thread::spawn(move || {
-        err_handler.process();
+        match out_handler.process() {
+            Err(error) => {
+                panic!("exception in out_handler {:?}", error)
+            },
+            _ => (),
+        }
     });
 
-    out_thread.join();
-    err_thread.join();
+    let err_thread = thread::spawn(move || {
+        match err_handler.process() {
+            Err(error) => {
+                panic!("exception in err_handler {:?}", error)
+            },
+            _ => (),
+        }
+    });
+
+    match out_thread.join() {
+        Err(error) => {
+            panic!("failed to join out_thread {:?}", error)
+        },
+        _ => (),
+    }
+    match err_thread.join() {
+        Err(error) => {
+            panic!("failed to join err_thread {:?}", error)
+        },
+        _ => (),
+    }
 
     let exit_code = child.wait().expect("child was not running").code().unwrap();
 
     std::process::exit(exit_code);
-
-    Ok(())
 }
