@@ -189,6 +189,7 @@ impl<T: Read, W: Write> LogHandler<T, W> {
                         return Ok(());
                     }
                     write!(self.output, "{}", buf)?;
+                    self.output.flush()?;
                     buf.clear();
                 }
             },
@@ -239,11 +240,15 @@ impl<T: Read, W: Write> LogHandler<T, W> {
                     }
 
                     match config.mode {
-                        LogMode::TEE => write!(self.output, "{}", buf)?,
+                        LogMode::TEE => {
+                            write!(self.output, "{}", buf)?;
+                            self.output.flush()?;
+                        }
                         _ => {},
                     }
 
                     write!(file, "{}", buf)?;
+                    file.flush()?;
                     size += len as u64;
 
                     buf.clear();
