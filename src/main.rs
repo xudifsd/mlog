@@ -163,6 +163,10 @@ struct LogHandler<R: Read, W: Write> {
     config: Option<FileConfig>,
     input: BufReader<R>,
     output: BufWriter<W>,
+
+    log_file: Option<File>,
+    file_size: u64,
+    file_c_time: u64,
 }
 
 impl<T: Read, W: Write> LogHandler<T, W> {
@@ -175,85 +179,75 @@ impl<T: Read, W: Write> LogHandler<T, W> {
             config: config,
             input: BufReader::new(input),
             output: BufWriter::new(output),
+            log_file: None,
+            file_size: 0,
+            file_c_time: 0,
         })
+    }
+
+    fn open_new_file(&mut self) -> std::io::Result<()> {
+        let path = self.config.unwrap().name.as_str();
+
+        rotate_files(path, self.config.unwrap().num)?;
+        self.log_file = Some(OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?);
+        self.file_size = 0;
+        self.file_c_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+        Ok(())
+    }
+
+    fn write(&mut self, content: &str) -> std::io::Result<()> {
+        match self.config {
+            None => {
+                write!(self.output, "{}", content)?;
+                self.output.flush()?;
+            },
+            Some(ref config) => {
+                if let None = self.log_file {
+                    self.open_new_file()?;
+                }
+
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+                if config.time != 0 && now - self.file_c_time >= config.time {
+                    self.open_new_file()?;
+                }
+
+                if config.size != 0 && self.file_size >= config.size {
+                    self.open_new_file()?;
+                }
+
+                match config.mode {
+                    LogMode::TEE => {
+                        write!(self.output, "{}", content)?;
+                        self.output.flush()?;
+                    }
+                    _ => {},
+                }
+
+                write!(self.log_file.unwrap(), "{}", content)?;
+                self.log_file.unwrap().flush()?;
+                self.file_size += content.len() as u64;
+            }
+        }
+        Ok(())
     }
 
     fn process(&mut self) -> std::io::Result<()> {
         let mut buf = String::new();
 
-        match self.config {
-            None => {
-                loop {
-                    let len = self.input.read_line(&mut buf)?;
-                    if len == 0 {
-                        return Ok(());
-                    }
-                    write!(self.output, "{}", buf)?;
-                    self.output.flush()?;
-                    buf.clear();
-                }
-            },
-            Some(ref config) => {
-                let path = config.name.as_str();
-
-                rotate_files(path, config.num)?;
-
-                let mut file = OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(path)?;
-
-                let mut c_time = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-
-                let mut size = 0;
-
-                loop {
-                    let len = self.input.read_line(&mut buf)?;
-                    if len == 0 {
-                        return Ok(());
-                    }
-
-                    let now = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-
-                    if config.time != 0 && now - c_time >= config.time {
-                        rotate_files(path, config.num)?;
-
-                        file = OpenOptions::new()
-                            .append(true)
-                            .create(true)
-                            .open(path)?;
-                        c_time = now;
-                        size = 0
-                    }
-
-                    if config.size != 0 && size >= config.size {
-                        rotate_files(path, config.num)?;
-
-                        file = OpenOptions::new()
-                            .append(true)
-                            .create(true)
-                            .open(path)?;
-                        c_time = now;
-                        size = 0
-                    }
-
-                    match config.mode {
-                        LogMode::TEE => {
-                            write!(self.output, "{}", buf)?;
-                            self.output.flush()?;
-                        }
-                        _ => {},
-                    }
-
-                    write!(file, "{}", buf)?;
-                    file.flush()?;
-                    size += len as u64;
-
-                    buf.clear();
-                }
+        loop {
+            let len = self.input.read_line(&mut buf)?;
+            if len == 0 {
+                return Ok(());
             }
+            self.write(buf.as_str());
+            buf.clear();
         }
     }
 }
