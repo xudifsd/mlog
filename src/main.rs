@@ -1,4 +1,4 @@
-use std::process::{Command, Stdio};
+use std::process::{Command, Stdio, ChildStdout};
 
 use std::thread;
 
@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::time::SystemTime;
 
 use std::io;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Stdout};
 use std::io::prelude::*;
 
 use clap::{Arg, App};
@@ -161,8 +161,8 @@ fn get_config(config_path: Option<&str>) -> Result<LogConfig, std::io::Error> {
 
 struct LogHandler<R: Read, W: Write> {
     config: Option<FileConfig>,
-    input: BufReader<R>,
-    output: BufWriter<W>,
+    input: Option<BufReader<R>>,
+    output: Option<BufWriter<W>>,
 
     log_file: Option<File>,
     file_size: u64,
@@ -170,32 +170,49 @@ struct LogHandler<R: Read, W: Write> {
 }
 
 impl<T: Read, W: Write> LogHandler<T, W> {
-    fn new(
+    pub fn new(
         config: Option<FileConfig>,
-        input: T,
-        output: W
+        input: Option<T>,
+        output: Option<W>,
     ) -> Result<Self, std::io::Error> {
+        let in_ = if let Some(i) = input {
+            Some(BufReader::new(i))
+        } else {
+            None
+        };
+
+        let out = if let Some(o) = output {
+            Some(BufWriter::new(o))
+        } else {
+            None
+        };
+
         Ok(LogHandler {
             config: config,
-            input: BufReader::new(input),
-            output: BufWriter::new(output),
+            input: in_,
+            output: out,
             log_file: None,
             file_size: 0,
             file_c_time: 0,
         })
     }
 
-    fn open_new_file(&mut self) -> std::io::Result<()> {
-        let path = self.config.unwrap().name.as_str();
-
-        rotate_files(path, self.config.unwrap().num)?;
-        self.log_file = Some(OpenOptions::new()
+    fn open_new_file(&self, path: &str, num: u32) -> std::io::Result<(File, u64, u64)> {
+        rotate_files(path, num)?;
+        let log_file = OpenOptions::new()
             .append(true)
             .create(true)
-            .open(path)?);
-        self.file_size = 0;
-        self.file_c_time = SystemTime::now()
+            .open(path)?;
+        let file_size = 0;
+        let file_c_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+        Ok((log_file, file_size, file_c_time))
+    }
+
+    pub fn writeln(&mut self, content: &str) -> std::io::Result<()> {
+        self.write(content)?;
+        self.write("\n")?;
 
         Ok(())
     }
@@ -203,50 +220,69 @@ impl<T: Read, W: Write> LogHandler<T, W> {
     fn write(&mut self, content: &str) -> std::io::Result<()> {
         match self.config {
             None => {
-                write!(self.output, "{}", content)?;
-                self.output.flush()?;
+                if let Some(ref mut output) = self.output {
+                    write!(output, "{}", content)?;
+                    output.flush()?;
+                }
             },
             Some(ref config) => {
                 if let None = self.log_file {
-                    self.open_new_file()?;
+                    let (f, size, time) = self.open_new_file(config.name.as_str(), config.num)?;
+                    self.log_file = Some(f);
+                    self.file_size = size;
+                    self.file_c_time = time;
                 }
 
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
                 if config.time != 0 && now - self.file_c_time >= config.time {
-                    self.open_new_file()?;
+                    let (f, size, time) = self.open_new_file(config.name.as_str(), config.num)?;
+                    self.log_file = Some(f);
+                    self.file_size = size;
+                    self.file_c_time = time;
                 }
 
                 if config.size != 0 && self.file_size >= config.size {
-                    self.open_new_file()?;
+                    let (f, size, time) = self.open_new_file(config.name.as_str(), config.num)?;
+                    self.log_file = Some(f);
+                    self.file_size = size;
+                    self.file_c_time = time;
                 }
 
                 match config.mode {
                     LogMode::TEE => {
-                        write!(self.output, "{}", content)?;
-                        self.output.flush()?;
+                        if let Some(ref mut output) = self.output {
+                            write!(output, "{}", content)?;
+                            output.flush()?;
+                        }
                     }
                     _ => {},
                 }
 
-                write!(self.log_file.unwrap(), "{}", content)?;
-                self.log_file.unwrap().flush()?;
-                self.file_size += content.len() as u64;
+                if let Some(ref mut file) = self.log_file {
+                    write!(file, "{}", content)?;
+                    file.flush()?;
+                    self.file_size += content.len() as u64;
+                }
             }
         }
         Ok(())
     }
 
-    fn process(&mut self) -> std::io::Result<()> {
+    pub fn process(&mut self) -> std::io::Result<()> {
+        if self.input.is_none() {
+            return Ok(());
+        }
+
         let mut buf = String::new();
 
         loop {
-            let len = self.input.read_line(&mut buf)?;
+            let len = self.input.as_mut().unwrap().read_line(&mut buf)?;
             if len == 0 {
                 return Ok(());
             }
-            self.write(buf.as_str());
+            self.write(buf.as_str())?;
             buf.clear();
         }
     }
@@ -324,13 +360,14 @@ fn main() -> io::Result<()> {
     let stdout = child.stdout.take().expect("Could not capture standard output.");
     let stderr = child.stderr.take().expect("Could not capture standard error.");
 
-    let mut out_handler = LogHandler::new(config.stdout, stdout, std::io::stdout())?;
-    let mut err_handler = LogHandler::new(config.stderr, stderr, std::io::stderr())?;
+    let mut out_handler = LogHandler::new(config.stdout, Some(stdout), Some(std::io::stdout()))?;
+    let mut err_handler = LogHandler::new(config.stderr, Some(stderr), Some(std::io::stderr()))?;
+    let mut mlog_handler: LogHandler<ChildStdout, Stdout> = LogHandler::new(config.mlog, None, None)?;
 
     let out_thread = thread::spawn(move || {
         match out_handler.process() {
             Err(error) => {
-                panic!("exception in out_handler {:?}", error)
+                panic!("exception in out_handler {:?}", error) // TODO, use log here
             },
             _ => (),
         }
@@ -339,7 +376,7 @@ fn main() -> io::Result<()> {
     let err_thread = thread::spawn(move || {
         match err_handler.process() {
             Err(error) => {
-                panic!("exception in err_handler {:?}", error)
+                panic!("exception in err_handler {:?}", error) // TODO, use log here
             },
             _ => (),
         }
@@ -347,13 +384,13 @@ fn main() -> io::Result<()> {
 
     match out_thread.join() {
         Err(error) => {
-            panic!("failed to join out_thread {:?}", error)
+            mlog_handler.writeln(format!("failed to join out_thread {:?}", error).as_str())?;
         },
         _ => (),
     }
     match err_thread.join() {
         Err(error) => {
-            panic!("failed to join err_thread {:?}", error)
+            mlog_handler.writeln(format!("failed to join err_thread {:?}", error).as_str())?;
         },
         _ => (),
     }
